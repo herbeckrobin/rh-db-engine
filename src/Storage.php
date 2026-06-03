@@ -113,9 +113,19 @@ final class Storage
 
     private function writeGuardFiles(string $path): void
     {
+        // Apache 2.4 (mod_authz_core) und 2.2 (mod_access_compat) gleichzeitig abdecken.
+        // ACHTUNG: Nginx wertet .htaccess NICHT aus, dort muss der Backup-Pfad serverseitig
+        // gesperrt werden (location-Block auf rh-blueprint-data/). Der nicht erratbare
+        // Random-Dateiname (Exporter) ist die eigentliche Absicherung, die hier ist Defense-in-Depth.
+        //
+        // Migration: eine vorhandene .htaccess der alten Generation (nur 2.2-Syntax) wird
+        // überschrieben, sonst greift der 2.4-Schutz auf Bestands-Installs nie.
         $htaccess = trailingslashit($path) . '.htaccess';
-        if (! file_exists($htaccess)) {
-            file_put_contents($htaccess, "Order deny,allow\nDeny from all\n");
+        $desired = "<IfModule mod_authz_core.c>\n  Require all denied\n</IfModule>\n"
+            . "<IfModule !mod_authz_core.c>\n  Order deny,allow\n  Deny from all\n</IfModule>\n";
+        $current = is_readable($htaccess) ? (string) file_get_contents($htaccess) : '';
+        if (! str_contains($current, 'Require all denied')) {
+            file_put_contents($htaccess, $desired);
         }
 
         $indexPhp = trailingslashit($path) . 'index.php';

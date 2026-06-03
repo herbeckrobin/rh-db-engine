@@ -36,7 +36,9 @@ final class Exporter
         $manifestFile = $this->storage->reserveTempFile('manifest');
         file_put_contents($manifestFile, (string) wp_json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 
-        $zipName = sprintf('backup-%s.zip', gmdate('Ymd-His'));
+        // Nicht erratbarer Datei-Token gegen direktes Abgreifen im Webroot (Nginx ignoriert
+        // die .htaccess). Der Zeitstempel allein waere sekundengenau bruteforce-bar.
+        $zipName = sprintf('backup-%s-%s.zip', gmdate('Ymd-His'), wp_generate_password(20, false, false));
         $zipPath = trailingslashit($this->storage->backupsPath()) . $zipName;
 
         $this->buildZip($zipPath, $sqlFile, $manifestFile, $includeUploads);
