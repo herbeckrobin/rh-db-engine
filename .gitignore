@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+
+# Library: vendor und Lock nicht committen.
+/vendor/
+composer.lock

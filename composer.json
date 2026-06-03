@@ -1,0 +1,23 @@
+{
+    "name": "rh/db-engine",
+    "description": "Geteilte DB-Engine der rh-blueprint Kollektion: Storage, Export, Import, Search-Replace.",
+    "type": "library",
+    "license": "GPL-2.0-or-later",
+    "authors": [
+        {
+            "name": "Robin Herbeck",
+            "homepage": "https://robinherbeck.de"
+        }
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "files": [
+            "rh-db-engine.php"
+        ]
+    },
+    "config": {
+        "optimize-autoloader": true
+    }
+}
