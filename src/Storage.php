@@ -111,6 +111,91 @@ final class Storage
         return trailingslashit($this->jobsPath()) . $name;
     }
 
+    /**
+     * Persistentes Arbeitsverzeichnis für einen Job unter `jobs/{jobId}/`.
+     *
+     * Anders als reserveTempFile() ist dieses Verzeichnis dafür gedacht, über mehrere
+     * Hintergrund-Ticks (Requests) hinweg zu überleben (extrahierte db.sql, Chunks etc.).
+     * Der Aufrufer ist für das Aufräumen verantwortlich (oder die GC, siehe gcStaleJobs()).
+     * Der Job-Identifier wird auf alphanumerisch + Bindestrich begrenzt (Path-Traversal-Schutz).
+     */
+    public function jobWorkdir(string $jobId): string
+    {
+        $this->ensureReady();
+
+        $safe = preg_replace('/[^A-Za-z0-9\-]/', '', $jobId) ?? '';
+        if ($safe === '') {
+            $safe = 'job-' . wp_generate_password(8, false, false);
+        }
+
+        $dir = trailingslashit($this->jobsPath()) . $safe;
+        if (! is_dir($dir)) {
+            wp_mkdir_p($dir);
+        }
+
+        return $dir;
+    }
+
+    /**
+     * Räumt verwaiste Einträge im jobs/-Ordner auf, die älter als $maxAgeSeconds sind.
+     *
+     * Greift abgebrochene Sync-Sessions und Tick-Workdirs ab, deren Job nie sauber
+     * abgeschlossen hat. Bei großen Transfers (10 GB+) verhindert das eine volllaufende Platte.
+     * Guard-Files (.htaccess, index.php) werden nie angefasst.
+     *
+     * @return int Anzahl gelöschter Top-Level-Einträge.
+     */
+    public function gcStaleJobs(int $maxAgeSeconds): int
+    {
+        $jobsDir = $this->jobsPath();
+        if (! is_dir($jobsDir)) {
+            return 0;
+        }
+
+        $threshold = time() - max(0, $maxAgeSeconds);
+        $removed = 0;
+
+        $entries = glob(trailingslashit($jobsDir) . '*') ?: [];
+        foreach ($entries as $entry) {
+            $base = basename($entry);
+            if ($base === '.htaccess' || $base === 'index.php') {
+                continue;
+            }
+
+            $mtime = @filemtime($entry);
+            if ($mtime === false || $mtime > $threshold) {
+                continue;
+            }
+
+            if (is_dir($entry)) {
+                $this->deleteDirRecursive($entry);
+                $removed++;
+            } elseif (is_file($entry)) {
+                // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- GC einer verwaisten Temp-Datei, ein Fehlschlag ist unkritisch.
+                if (@unlink($entry)) {
+                    $removed++;
+                }
+            }
+        }
+
+        return $removed;
+    }
+
+    private function deleteDirRecursive(string $dir): void
+    {
+        $items = glob(trailingslashit($dir) . '*') ?: [];
+        foreach ($items as $item) {
+            if (is_dir($item)) {
+                $this->deleteDirRecursive($item);
+            } else {
+                // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- GC einer verwaisten Temp-Datei, ein Fehlschlag ist unkritisch.
+                @unlink($item);
+            }
+        }
+        // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- GC eines verwaisten Temp-Verzeichnisses, ein Fehlschlag ist unkritisch.
+        @rmdir($dir);
+    }
+
     private function writeGuardFiles(string $path): void
     {
         // Apache 2.4 (mod_authz_core) und 2.2 (mod_access_compat) gleichzeitig abdecken.
