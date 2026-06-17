@@ -1,0 +1,43 @@
+name: Auto-Tag
+
+# Library-Tag-Guard: verhindert, dass Library-Code auf main strandet, ohne getaggt
+# zu sein (dann ist er fuer Composer unsichtbar und Konsumenten-Releases buendeln
+# die alte Version). Bei jedem Push auf main wird die in version.php deklarierte
+# Version getaggt, falls der Tag noch fehlt. Existiert er schon, passiert nichts.
+#
+# Sicher fuer Libraries: ein Tag loest KEIN Kunden-Update aus. Konsumenten ziehen
+# die neue Version erst, wenn ein Plugin per composer update + Re-Release nachzieht.
+
+on:
+  push:
+    branches: [main]
+    paths: ['version.php']
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag declared version if missing
+        run: |
+          VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' version.php | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Keine Version in version.php gefunden."
+            exit 1
+          fi
+          TAG="v$VERSION"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG existiert bereits, nichts zu tun."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Tag $TAG erstellt und gepusht."
