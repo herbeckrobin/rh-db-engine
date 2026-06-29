@@ -482,8 +482,18 @@ final class Importer
     }
 
     /**
+     * Baut die Search-Replace-Paare Quelle -> Ziel aus dem Manifest.
+     *
+     * Deckt bewusst mehrere Schreibweisen derselben Quell-URL ab, damit eingebrannte
+     * absolute URLs im Content vollstaendig umgeschrieben werden:
+     *  - beide Schemata der Quelle (http:// und https://), da z.B. DDEV sich als https
+     *    meldet, Theme-Assets aber als http:// eingebrannt sein können.
+     *  - die JSON-escaped Slash-Form (http:\/\/...), wie sie in Block-Markup-Attributen
+     *    von Synced Patterns / wp_block steht.
+     * Längste From-Strings zuerst, damit keine Teilersetzung eine andere blockiert.
+     *
      * @param array<string, mixed> $manifest
-     * @return array<string, string> old => new URL-Paare
+     * @return array<string, string> from => to
      */
     private function urlRewritePairs(array $manifest): array
     {
@@ -493,14 +503,44 @@ final class Importer
         $newHomeUrl = (string) get_home_url();
 
         $pairs = [];
-        if ($oldSiteUrl !== '' && $oldSiteUrl !== $newSiteUrl) {
-            $pairs[$oldSiteUrl] = $newSiteUrl;
-        }
-        if ($oldHomeUrl !== '' && $oldHomeUrl !== $newHomeUrl) {
-            $pairs[$oldHomeUrl] = $newHomeUrl;
-        }
+        $this->addUrlVariants($pairs, $oldSiteUrl, $newSiteUrl);
+        $this->addUrlVariants($pairs, $oldHomeUrl, $newHomeUrl);
+
+        uksort($pairs, static fn (string $a, string $b): int => strlen($b) <=> strlen($a));
 
         return $pairs;
+    }
+
+    /**
+     * Fügt für ein Quell/Ziel-Paar alle relevanten Schreibvarianten hinzu: beide Schemata
+     * (http/https) der Quelle und je die JSON-escaped Slash-Form, jeweils auf die Ziel-URL.
+     *
+     * @param array<string, string> $pairs
+     */
+    private function addUrlVariants(array &$pairs, string $old, string $new): void
+    {
+        if ($old === '' || $new === '') {
+            return;
+        }
+
+        $oldRest = preg_replace('#^https?://#i', '', rtrim($old, '/'));
+        $newClean = rtrim($new, '/');
+        if ($oldRest === null || $oldRest === '') {
+            return;
+        }
+
+        foreach (['http://', 'https://'] as $scheme) {
+            $from = $scheme . $oldRest;
+            if ($from === $newClean) {
+                continue;
+            }
+            $pairs[$from] = $newClean;
+
+            $escFrom = str_replace('/', '\\/', $from);
+            if ($escFrom !== $from) {
+                $pairs[$escFrom] = str_replace('/', '\\/', $newClean);
+            }
+        }
     }
 
     /**
@@ -535,6 +575,8 @@ final class Importer
         /** @var array<int, array<string, string>> $columns */
         $columns = (array) $wpdb->get_results("SHOW COLUMNS FROM {$tableEsc}", ARRAY_A);
 
+        $isPostsTable = ($table === $wpdb->posts);
+
         $textColumns = [];
         $primaryKey = null;
         foreach ($columns as $col) {
@@ -543,11 +585,15 @@ final class Importer
             if ($field === '') {
                 continue;
             }
-            if (str_contains($type, 'char') || str_contains($type, 'text') || str_contains($type, 'blob')) {
-                $textColumns[] = $field;
-            }
             if (($col['Key'] ?? '') === 'PRI' && $primaryKey === null) {
                 $primaryKey = $field;
+            }
+            // guid ist ein permanenter Identifier, kein anzuzeigender Link, nicht umschreiben.
+            if ($isPostsTable && $field === 'guid') {
+                continue;
+            }
+            if (str_contains($type, 'char') || str_contains($type, 'text') || str_contains($type, 'blob')) {
+                $textColumns[] = $field;
             }
         }
 
