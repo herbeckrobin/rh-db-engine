@@ -381,11 +381,16 @@ final class Importer
                 continue;
             }
 
-            $baseName = basename($normalized);
-            if (!in_array($baseName, self::ALLOWED_ENTRIES, true)) {
+            // Gegen den VOLLEN Pfad prüfen, nicht den basename: db.sql und manifest.json liegen
+            // im ZIP-Root. Ein basename-Vergleich würde auch eine gleichnamige Datei aus den
+            // uploads matchen (z.B. uploads/really-simple-ssl/…/manifest.json) und beim flachen
+            // Extrahieren die echte Root-manifest.json überschreiben -> Import bricht mit
+            // "kein db_prefix" ab, obwohl das Backup intakt ist.
+            if (!in_array($normalized, self::ALLOWED_ENTRIES, true)) {
                 continue;
             }
 
+            $baseName = basename($normalized);
             $stream = $zip->getStream($name);
             if ($stream === false) {
                 continue;
