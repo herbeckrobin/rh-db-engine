@@ -62,17 +62,54 @@ final class Storage
     }
 
     /**
+     * Pfad zu einem Unterordner der Backups, angelegt und abgeschirmt.
+     *
+     * Welche Unterordner es gibt und was sie bedeuten, entscheidet der Aufrufer: die
+     * Engine kennt nur "eine Ebene unter backups/". Ein leerer Name führt zurück auf
+     * den Backup-Ordner selbst, damit alte Aufrufe unverändert funktionieren.
+     */
+    public function backupsSubPath(string $sub): string
+    {
+        $safe = preg_replace('/[^a-z0-9\-]/', '', strtolower($sub)) ?? '';
+        if ($safe === '') {
+            return $this->backupsPath();
+        }
+
+        $path = trailingslashit($this->backupsPath()) . $safe;
+        if (! is_dir($path)) {
+            wp_mkdir_p($path);
+            $this->writeGuardFiles($path);
+        }
+
+        return $path;
+    }
+
+    /**
      * Löst einen Dateinamen innerhalb eines erlaubten Roots auf.
+     *
+     * Erlaubt ist der blosse Name oder ein Name mit genau einer Ordner-Ebene davor
+     * ("automatic/backup-xy.zip"), damit sich Sicherungen nach Anlass trennen lassen.
+     * Tiefer geht es bewusst nicht: mehr Ebenen gibt es nicht, und was es nicht gibt,
+     * muss auch nicht erlaubt sein.
+     *
      * Schützt gegen Path-Traversal, die aufgelöste Datei MUSS unterhalb von $allowedRoot liegen.
      */
     public function resolveInside(string $allowedRoot, string $fileName): ?string
     {
-        $fileName = basename($fileName);
-        if ($fileName === '' || $fileName === '.' || $fileName === '..') {
+        $relativ = str_replace('\\', '/', trim($fileName));
+        $teile = array_values(array_filter(explode('/', $relativ), static fn (string $t): bool => $t !== ''));
+
+        if ($teile === [] || count($teile) > 2) {
             return null;
         }
 
-        $fullPath = trailingslashit($allowedRoot) . $fileName;
+        foreach ($teile as $teil) {
+            if ($teil === '.' || $teil === '..') {
+                return null;
+            }
+        }
+
+        $fullPath = trailingslashit($allowedRoot) . implode('/', $teile);
         $real = realpath($fullPath);
         $rootReal = realpath($allowedRoot);
 
@@ -80,6 +117,8 @@ final class Storage
             return null;
         }
 
+        // Die eigentliche Absicherung: egal was im Namen stand, das Ergebnis muss
+        // unterhalb der erlaubten Wurzel liegen. Fängt auch Symlinks nach aussen.
         if (! str_starts_with($real, trailingslashit($rootReal))) {
             return null;
         }
@@ -88,19 +127,49 @@ final class Storage
     }
 
     /**
-     * @return array<int, string> Datei-Basenames im Backups-Ordner, neueste zuerst.
+     * Alle Sicherungen, auch die in Unterordnern.
+     *
+     * Rückgabe sind Pfade relativ zum Backup-Ordner ("automatic/backup-xy.zip"), damit
+     * der Aufrufer sie direkt an resolveInside() weiterreichen kann. Flach liegende
+     * Archive aus der Zeit vor den Unterordnern erscheinen weiterhin mit blossem Namen.
+     *
+     * @return array<int, string> Neueste zuerst.
      */
     public function listBackups(): array
     {
-        $dir = $this->backupsPath();
-        if (! is_dir($dir)) {
+        return $this->listBackupsIn($this->backupsPath(), true);
+    }
+
+    /**
+     * @return array<int, string> Datei-Basenames im angegebenen Ordner, neueste zuerst.
+     *                            Mit $withSubdirs zusätzlich eine Ebene tiefer, dann als
+     *                            relativer Pfad.
+     */
+    public function listBackupsIn(string $dir, bool $withSubdirs = false): array
+    {
+        if ($dir === '' || ! is_dir($dir)) {
             return [];
         }
 
-        $files = glob(trailingslashit($dir) . '*.zip') ?: [];
+        $muster = $withSubdirs
+            ? [trailingslashit($dir) . '*.zip', trailingslashit($dir) . '*/*.zip']
+            : [trailingslashit($dir) . '*.zip'];
+
+        $files = [];
+        foreach ($muster as $m) {
+            foreach (glob($m) ?: [] as $f) {
+                $files[] = $f;
+            }
+        }
+
         usort($files, static fn (string $a, string $b): int => filemtime($b) <=> filemtime($a));
 
-        return array_map('basename', $files);
+        $basis = trailingslashit($dir);
+
+        return array_map(
+            static fn (string $f): string => str_starts_with($f, $basis) ? substr($f, strlen($basis)) : basename($f),
+            $files
+        );
     }
 
     public function reserveTempFile(string $prefix): string
@@ -134,6 +203,49 @@ final class Storage
         }
 
         return $dir;
+    }
+
+    /**
+     * Markiert ein Job-Verzeichnis als "lebt noch", damit die GC es in Ruhe lässt.
+     *
+     * Nötig, weil die mtime eines Verzeichnisses sich nur ändert, wenn direkte Kinder
+     * angelegt oder gelöscht werden. Ein laufender Import liest stundenlang aus einer
+     * bereits entpackten db.sql und altert dabei aus Sicht der GC ungebremst weiter.
+     * Wird pro Tick von Importer und Exporter aufgerufen.
+     */
+    public function touchJobWorkdir(string $workdir): void
+    {
+        if ($workdir === '' || ! is_dir($workdir)) {
+            return;
+        }
+
+        // Nur innerhalb von jobs/, damit ein manipulierter Cursor nicht beliebige
+        // Zeitstempel im Dateisystem verändern kann.
+        $jobsReal = realpath($this->jobsPath());
+        $dirReal = realpath($workdir);
+        if ($jobsReal === false || $dirReal === false || ! str_starts_with($dirReal, trailingslashit($jobsReal))) {
+            return;
+        }
+
+        // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Heartbeat, ein Fehlschlag ist unkritisch.
+        @touch($dirReal);
+    }
+
+    /**
+     * Setzt restriktive Rechte auf eine erzeugte Datei.
+     *
+     * Backups und Dumps enthalten die komplette Kundendatenbank inklusive Passwort-Hashes
+     * und Zugangsdaten aus wp_options. Mit der üblichen umask entstehen sie als 0644 und
+     * sind damit auf Shared Hosting ohne Nutzer-Isolation für andere Konten lesbar.
+     */
+    public function protectFile(string $path): void
+    {
+        if (! is_file($path)) {
+            return;
+        }
+
+        // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- auf manchen Dateisystemen nicht unterstützt, dann bleibt es beim Default.
+        @chmod($path, 0600);
     }
 
     /**

@@ -19,7 +19,13 @@ final class ExportCursor
     public const PHASE_DONE = 'done';
 
     /**
-     * @param array<int, string> $excludedTables Vollqualifizierte Tabellennamen, die nicht gedumpt werden.
+     * @param array<int, string>      $excludedTables Vollqualifizierte Tabellennamen, die nicht gedumpt werden.
+     * @param array<int, string>|null $rowKey         Primärschlüssel der zuletzt gedumpten Zeile. Damit blättert
+     *                                                der Dump über den Schlüssel statt über OFFSET und übersteht
+     *                                                Einfügungen und Löschungen während des Laufs.
+     * @param string|null            $stopBefore     Phase, vor der angehalten wird. Für Aufrufer, die
+     *                                                nur Dump und Manifest brauchen und das Archiv
+     *                                                selbst erzeugen.
      */
     public function __construct(
         public string $workdir,
@@ -33,12 +39,20 @@ final class ExportCursor
         public int $rowOffset = 0,
         public int $uploadsFileIndex = 0,
         public bool $headerWritten = false,
+        public ?string $targetDir = null,
+        public ?array $rowKey = null,
+        public ?string $stopBefore = null,
     ) {
     }
 
-    public static function start(string $workdir, bool $includeUploads, array $excludedTables = []): self
+    /**
+     * @param string|null $targetDir Zielordner für das fertige ZIP. Null = der normale
+     *                               backups/-Ordner. Wird für Sicherungskopien genutzt,
+     *                               die nicht in der Backup-Liste des Nutzers auftauchen sollen.
+     */
+    public static function start(string $workdir, bool $includeUploads, array $excludedTables = [], ?string $targetDir = null): self
     {
-        return new self($workdir, $includeUploads, $excludedTables);
+        return new self($workdir, $includeUploads, $excludedTables, targetDir: $targetDir);
     }
 
     public function isDone(): bool
@@ -63,6 +77,9 @@ final class ExportCursor
             'row_offset' => $this->rowOffset,
             'uploads_file_index' => $this->uploadsFileIndex,
             'header_written' => $this->headerWritten,
+            'target_dir' => $this->targetDir,
+            'row_key' => $this->rowKey,
+            'stop_before' => $this->stopBefore,
         ];
     }
 
@@ -83,6 +100,9 @@ final class ExportCursor
             rowOffset: (int) ($data['row_offset'] ?? 0),
             uploadsFileIndex: (int) ($data['uploads_file_index'] ?? 0),
             headerWritten: (bool) ($data['header_written'] ?? false),
+            targetDir: isset($data['target_dir']) ? (string) $data['target_dir'] : null,
+            rowKey: is_array($data['row_key'] ?? null) ? array_map('strval', $data['row_key']) : null,
+            stopBefore: isset($data['stop_before']) ? (string) $data['stop_before'] : null,
         );
     }
 }

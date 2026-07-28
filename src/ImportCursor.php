@@ -37,6 +37,9 @@ final class ImportCursor
         public string $targetPrefix = '',
         public bool $includesUploads = false,
         public array $manifest = [],
+        public int $uploadsFailed = 0,
+        public string $targetSiteUrl = '',
+        public string $targetHomeUrl = '',
     ) {
     }
 
@@ -68,6 +71,9 @@ final class ImportCursor
             'target_prefix' => $this->targetPrefix,
             'includes_uploads' => $this->includesUploads,
             'manifest' => $this->manifest,
+            'uploads_failed' => $this->uploadsFailed,
+            'target_site_url' => $this->targetSiteUrl,
+            'target_home_url' => $this->targetHomeUrl,
         ];
     }
 
@@ -89,6 +95,9 @@ final class ImportCursor
             targetPrefix: (string) ($data['target_prefix'] ?? ''),
             includesUploads: (bool) ($data['includes_uploads'] ?? false),
             manifest: is_array($data['manifest'] ?? null) ? $data['manifest'] : [],
+            uploadsFailed: (int) ($data['uploads_failed'] ?? 0),
+            targetSiteUrl: (string) ($data['target_site_url'] ?? ''),
+            targetHomeUrl: (string) ($data['target_home_url'] ?? ''),
         );
     }
 }
