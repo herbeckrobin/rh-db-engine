@@ -92,24 +92,31 @@ final class Importer
         $this->storage->touchJobWorkdir($cursor->workdir);
 
         while (!$cursor->isDone() && microtime(true) < $deadline) {
-            switch ($cursor->phase) {
-                case ImportCursor::PHASE_EXTRACT:
-                    $this->stepExtract($cursor);
-                    break;
-                case ImportCursor::PHASE_SQL:
-                    $this->stepSql($cursor, $tableFilter, $deadline);
-                    break;
-                case ImportCursor::PHASE_META_REWRITE:
-                    $this->stepMetaRewrite($cursor);
-                    break;
-                case ImportCursor::PHASE_URL_REWRITE:
-                    $this->stepUrlRewrite($cursor, $deadline);
-                    break;
-                case ImportCursor::PHASE_UPLOADS:
-                    $this->stepUploads($cursor, $includeUploads, $deadline);
-                    break;
-                default:
-                    $cursor->phase = ImportCursor::PHASE_DONE;
+            try {
+                switch ($cursor->phase) {
+                    case ImportCursor::PHASE_EXTRACT:
+                        $this->stepExtract($cursor);
+                        break;
+                    case ImportCursor::PHASE_SQL:
+                        $this->stepSql($cursor, $tableFilter, $deadline);
+                        break;
+                    case ImportCursor::PHASE_META_REWRITE:
+                        $this->stepMetaRewrite($cursor);
+                        break;
+                    case ImportCursor::PHASE_URL_REWRITE:
+                        $this->stepUrlRewrite($cursor, $deadline);
+                        break;
+                    case ImportCursor::PHASE_SWAP:
+                        $this->stepSwap($cursor);
+                        break;
+                    case ImportCursor::PHASE_UPLOADS:
+                        $this->stepUploads($cursor, $includeUploads, $deadline);
+                        break;
+                    default:
+                        $cursor->phase = ImportCursor::PHASE_DONE;
+                }
+            } catch (SwapUnavailable $e) {
+                $this->abandonSwap($cursor, $e->getMessage());
             }
         }
 
@@ -144,6 +151,49 @@ final class Importer
          * Anknüpfpunkt für Page-Caches (Plugin- oder Server-Ebene).
          */
         do_action('rh-db-engine/import_finished');
+    }
+
+    /**
+     * Verwirft den Umschalt-Modus und beginnt die SQL-Phase im direkten Modus von vorn.
+     *
+     * Greift nur, wenn sich erst mitten im Dump herausstellt, dass die Tabellennamen unter
+     * dem Stage-Prefix zu lang würden. Alles bereits Geschriebene lag in Schattentabellen
+     * und ist damit folgenlos: die Live-Tabellen hat bis hierhin niemand angefasst.
+     */
+    private function abandonSwap(ImportCursor $cursor, string $reason): void
+    {
+        (new TableSwap())->dropLeftovers();
+
+        $cursor->swapMode = false;
+        $cursor->workPrefix = $cursor->targetPrefix;
+        $cursor->createdTables = [];
+        $cursor->sqlByteOffset = 0;
+        $cursor->urlRewriteTableIndex = 0;
+        $cursor->urlRewriteRowOffset = 0;
+        $cursor->phase = ImportCursor::PHASE_SQL;
+
+        /**
+         * Der Import schreibt ab jetzt wieder direkt in die Live-Tabellen. Der Aufrufer
+         * sollte darauf sein Sicherheitsnetz spannen (Sicherungskopie, Notfall-Wiederanlauf).
+         */
+        do_action('rh-db-engine/swap_unavailable', $reason);
+    }
+
+    /**
+     * Entscheidet vor dem ersten Schreibzugriff, ob dieser Import atomar umschalten kann.
+     */
+    private function decideSwapMode(string $targetPrefix): bool
+    {
+        /**
+         * Notausstieg, falls eine Umgebung ausdrücklich den direkten Weg will.
+         */
+        if (!apply_filters('rh-db-engine/atomic_swap', true)) {
+            return false;
+        }
+
+        $swap = new TableSwap();
+
+        return $swap->prefixIsUsable($targetPrefix) && $swap->isSupported();
     }
 
     // ============================================================
@@ -187,6 +237,23 @@ final class Importer
         $cursor->targetSiteUrl = (string) get_site_url();
         $cursor->targetHomeUrl = (string) get_home_url();
         $cursor->includesUploads = !empty($manifest['includes_uploads']);
+
+        // Jetzt entscheiden, nicht später: ab dem ersten Statement steht fest, wohin
+        // geschrieben wird. Im Umschalt-Modus zuerst Reste eines abgebrochenen Laufs
+        // wegräumen, sonst mischen sich zwei Stände in den Schattentabellen.
+        $cursor->swapMode = $this->decideSwapMode($cursor->targetPrefix);
+        if ($cursor->swapMode) {
+            (new TableSwap())->dropLeftovers();
+            $cursor->workPrefix = TableSwap::STAGE_PREFIX;
+        } else {
+            $cursor->workPrefix = $cursor->targetPrefix;
+            do_action(
+                'rh-db-engine/swap_unavailable',
+                'Diese Datenbank kann nicht atomar umschalten (fehlende Rechte oder abgeschaltet).'
+            );
+        }
+
+        $cursor->createdTables = [];
         $cursor->phase = ImportCursor::PHASE_SQL;
         $cursor->sqlByteOffset = 0;
     }
@@ -342,13 +409,19 @@ final class Importer
             return;
         }
 
-        $sql = $this->rewriteStatementPrefix($sql, $cursor->sourcePrefix, $cursor->targetPrefix);
+        // Im Umschalt-Modus zeigt der Arbeits-Prefix auf die Schattentabellen. Der Dump landet
+        // dort und nicht auf der Live-Site, bis am Ende umgeschaltet wird.
+        $workPrefix = $cursor->effectivePrefix();
 
-        $this->assertStatementAllowed($sql, $cursor->targetPrefix);
+        $sql = $this->rewriteStatementPrefix($sql, $cursor->sourcePrefix, $workPrefix);
 
-        if (!$this->shouldExecuteStatement($sql, $tableFilter)) {
+        $this->assertStatementAllowed($sql, $workPrefix);
+
+        if (!$this->shouldExecuteStatement($sql, $tableFilter, $workPrefix, $cursor->targetPrefix)) {
             return;
         }
+
+        $this->rememberCreatedTable($sql, $cursor, $workPrefix);
 
         // Ein Fehlschlag darf NICHT still durchrutschen: an dieser Stelle sind Tabellen
         // bereits gedroppt, ein ignorierter Fehler hinterlässt eine halb ersetzte Datenbank,
@@ -417,7 +490,7 @@ final class Importer
 
     private function stepMetaRewrite(ImportCursor $cursor): void
     {
-        $this->rewriteMetaKeys($cursor->sourcePrefix, $cursor->targetPrefix);
+        $this->rewriteMetaKeys($cursor->sourcePrefix, $cursor->targetPrefix, $cursor->effectivePrefix());
         $cursor->phase = ImportCursor::PHASE_URL_REWRITE;
         $cursor->urlRewriteTableIndex = 0;
         $cursor->urlRewriteRowOffset = 0;
@@ -425,18 +498,20 @@ final class Importer
 
     private function stepUrlRewrite(ImportCursor $cursor, float $deadline): void
     {
+        $workPrefix = $cursor->effectivePrefix();
+
         $pairs = $this->urlRewritePairs($cursor->manifest, $cursor);
         if ($pairs === []) {
-            $cursor->phase = ImportCursor::PHASE_UPLOADS;
+            $cursor->phase = ImportCursor::PHASE_SWAP;
             return;
         }
 
-        $tables = $this->prefixedTables();
+        $tables = $this->prefixedTables($workPrefix);
         $count = count($tables);
 
         while ($cursor->urlRewriteTableIndex < $count) {
             $table = $tables[$cursor->urlRewriteTableIndex];
-            $rows = $this->rewriteTableChunk($table, $pairs, $cursor->urlRewriteRowOffset, self::URL_REWRITE_CHUNK);
+            $rows = $this->rewriteTableChunk($table, $pairs, $cursor->urlRewriteRowOffset, self::URL_REWRITE_CHUNK, $workPrefix);
 
             if ($rows < self::URL_REWRITE_CHUNK) {
                 // Tabelle fertig, weiter zur nächsten.
@@ -450,6 +525,44 @@ final class Importer
                 return;
             }
         }
+
+        $cursor->phase = ImportCursor::PHASE_SWAP;
+    }
+
+    /**
+     * Schaltet die fertigen Schattentabellen live.
+     *
+     * Das ist der einzige Moment, in dem dieser Import die Live-Datenbank anfasst, und er
+     * dauert einen Wimpernschlag. Alles davor lief in Schattentabellen, alles danach
+     * (Medien) kann die Site nicht mehr unbedienbar machen.
+     */
+    private function stepSwap(ImportCursor $cursor): void
+    {
+        if (!$cursor->swapMode) {
+            $cursor->phase = ImportCursor::PHASE_UPLOADS;
+            return;
+        }
+
+        /**
+         * Letzte Gelegenheit, in die Schattentabellen zu schreiben, bevor sie live gehen.
+         * rh-sync hängt hier seine site-eigenen Options ein (Adresse, aktive Plugins,
+         * Rollen), damit die Zielseite nach dem Umschalten sofort stimmt und kein
+         * Nachher-Reparieren mehr nötig ist.
+         */
+        do_action(
+            'rh-db-engine/before_table_swap',
+            TableSwap::STAGE_PREFIX,
+            $cursor->targetPrefix,
+            $cursor->createdTables
+        );
+
+        (new TableSwap())->swap($cursor->createdTables, $cursor->targetPrefix);
+
+        // Der Objekt-Cache zeigt jetzt noch auf den alten Stand. Die Medien-Phase läuft
+        // gleich über viele weitere Ticks, so lange darf die Site nicht falsch antworten.
+        $this->flushCaches();
+
+        do_action('rh-db-engine/after_table_swap', $cursor->targetPrefix, $cursor->createdTables);
 
         $cursor->phase = ImportCursor::PHASE_UPLOADS;
     }
@@ -787,10 +900,50 @@ final class Importer
     }
 
     /**
+     * Merkt sich eine angelegte Tabelle für das spätere Umschalten und stellt sicher, dass
+     * ihr Name unter dem Stage-Prefix überhaupt zulässig ist.
+     *
+     * @throws SwapUnavailable wenn der Name zu lang wird. Der Import beginnt dann direkt neu.
+     */
+    private function rememberCreatedTable(string $sql, ImportCursor $cursor, string $workPrefix): void
+    {
+        if (!$cursor->swapMode || strncasecmp($sql, 'CREATE TABLE', 12) !== 0) {
+            return;
+        }
+
+        $table = $this->extractTableFromStatement($sql);
+        if ($table === null || !str_starts_with($table, $workPrefix)) {
+            return;
+        }
+
+        $base = substr($table, strlen($workPrefix));
+
+        if (!(new TableSwap())->namesFit([$base])) {
+            throw new SwapUnavailable(sprintf(
+                'Die Tabelle %s wird unter dem Zwischen-Prefix länger als MySQL erlaubt.',
+                $base
+            ));
+        }
+
+        $cursor->rememberTable($base);
+    }
+
+    /**
+     * Entscheidet, ob ein Statement laufen darf.
+     *
+     * Der Tabellen-Filter des Aufrufers kennt nur die echten Tabellennamen der Zielseite.
+     * Im Umschalt-Modus trägt das Statement aber den Stage-Prefix, deshalb wird der Name
+     * für die Abfrage zurückübersetzt. Ohne diese Übersetzung liefe der Filter ins Leere
+     * und ein Sync-Profil würde stillschweigend alle Tabellen einspielen.
+     *
      * @param (callable(string): bool)|null $tableFilter
      */
-    private function shouldExecuteStatement(string $statement, ?callable $tableFilter): bool
-    {
+    private function shouldExecuteStatement(
+        string $statement,
+        ?callable $tableFilter,
+        string $workPrefix,
+        string $targetPrefix
+    ): bool {
         if ($tableFilter === null) {
             return true;
         }
@@ -799,6 +952,10 @@ final class Importer
         if ($table === null) {
             // Nur noch SET-Statements kommen ohne Tabelle hier an (siehe assertStatementAllowed).
             return true;
+        }
+
+        if ($workPrefix !== $targetPrefix && str_starts_with($table, $workPrefix)) {
+            $table = $targetPrefix . substr($table, strlen($workPrefix));
         }
 
         return $tableFilter($table);
@@ -823,7 +980,15 @@ final class Importer
         return null;
     }
 
-    private function rewriteMetaKeys(string $sourcePrefix, string $targetPrefix): void
+    /**
+     * Zieht die prefix-behafteten Meta- und Options-Schlüssel auf den Ziel-Prefix.
+     *
+     * Zwei verschiedene Prefixe im Spiel, und die Unterscheidung ist der Grund, warum die
+     * Zielseite am 2026-08-02 ohne Rollen dastand: geschrieben wird in die Tabellen unter
+     * `$workPrefix` (im Umschalt-Modus die Schattentabellen), aber die WERTE müssen den
+     * `$targetPrefix` tragen, weil WordPress nach dem Umschalten genau danach sucht.
+     */
+    private function rewriteMetaKeys(string $sourcePrefix, string $targetPrefix, string $workPrefix): void
     {
         global $wpdb;
 
@@ -840,7 +1005,7 @@ final class Importer
             'session_tokens',
         ];
 
-        $usermetaTable = $targetPrefix . 'usermeta';
+        $usermetaTable = $workPrefix . 'usermeta';
         foreach ($usermetaKeys as $key) {
             $wpdb->update(
                 $usermetaTable,
@@ -850,7 +1015,7 @@ final class Importer
         }
 
         $wpdb->update(
-            $targetPrefix . 'options',
+            $workPrefix . 'options',
             ['option_name' => $targetPrefix . 'user_roles'],
             ['option_name' => $sourcePrefix . 'user_roles']
         );
@@ -924,11 +1089,13 @@ final class Importer
     /**
      * @return array<int, string>
      */
-    private function prefixedTables(): array
+    private function prefixedTables(string $prefix = ''): array
     {
         global $wpdb;
 
-        $prefix = $wpdb->prefix;
+        if ($prefix === '') {
+            $prefix = (string) $wpdb->prefix;
+        }
         $like = str_replace('_', '\\_', $prefix) . '%';
         /** @var array<int, string> $tables */
         $tables = (array) $wpdb->get_col(
@@ -944,7 +1111,7 @@ final class Importer
      * @param array<string, string> $pairs
      * @return int Anzahl gelesener Zeilen in diesem Chunk (< $chunkSize => Tabelle fertig).
      */
-    private function rewriteTableChunk(string $table, array $pairs, int $offset, int $chunkSize): int
+    private function rewriteTableChunk(string $table, array $pairs, int $offset, int $chunkSize, string $workPrefix = ''): int
     {
         global $wpdb;
 
@@ -953,7 +1120,11 @@ final class Importer
         /** @var array<int, array<string, string>> $columns */
         $columns = (array) $wpdb->get_results("SHOW COLUMNS FROM {$tableEsc}", ARRAY_A);
 
-        $isPostsTable = ($table === $wpdb->posts);
+        // Über den Basisnamen erkennen, nicht über $wpdb->posts: im Umschalt-Modus heisst
+        // die Tabelle hier `rhstg_posts` und der Vergleich mit dem Live-Namen ginge daneben.
+        $prefix = $workPrefix !== '' ? $workPrefix : (string) $wpdb->prefix;
+        $isPostsTable = str_starts_with($table, $prefix)
+            && substr($table, strlen($prefix)) === 'posts';
 
         $textColumns = [];
         $primaryKey = null;

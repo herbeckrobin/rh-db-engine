@@ -18,11 +18,17 @@ final class ImportCursor
     public const PHASE_SQL = 'sql';
     public const PHASE_META_REWRITE = 'meta_rewrite';
     public const PHASE_URL_REWRITE = 'url_rewrite';
+    public const PHASE_SWAP = 'swap';
     public const PHASE_UPLOADS = 'uploads';
     public const PHASE_DONE = 'done';
 
     /**
      * @param array<string, mixed> $manifest Aus dem Backup gelesenes Manifest (nach extract gefüllt).
+     * @param bool $swapMode Import schreibt in Schattentabellen und schaltet am Ende atomar um.
+     * @param string $workPrefix Prefix, unter dem dieser Import arbeitet. Im Umschalt-Modus der
+     *                           Stage-Prefix, sonst der Ziel-Prefix.
+     * @param array<int, string> $createdTables Basisnamen (ohne Prefix) der vom Dump angelegten
+     *                                          Tabellen. Das ist die Liste, die umgeschaltet wird.
      */
     public function __construct(
         public string $zipPath,
@@ -40,12 +46,36 @@ final class ImportCursor
         public int $uploadsFailed = 0,
         public string $targetSiteUrl = '',
         public string $targetHomeUrl = '',
+        public bool $swapMode = false,
+        public string $workPrefix = '',
+        public array $createdTables = [],
     ) {
     }
 
     public static function start(string $zipPath, string $workdir): self
     {
         return new self($zipPath, $workdir);
+    }
+
+    /**
+     * Prefix, unter dem dieser Import gerade schreibt.
+     *
+     * Im Umschalt-Modus der Stage-Prefix, sonst der Ziel-Prefix. Der Fallback auf den
+     * Ziel-Prefix greift auch für Cursor aus einer älteren Version, die das Feld nicht kennen.
+     */
+    public function effectivePrefix(): string
+    {
+        return $this->workPrefix !== '' ? $this->workPrefix : $this->targetPrefix;
+    }
+
+    /**
+     * Merkt sich eine vom Dump angelegte Tabelle (Basisname ohne Prefix).
+     */
+    public function rememberTable(string $baseName): void
+    {
+        if ($baseName !== '' && !in_array($baseName, $this->createdTables, true)) {
+            $this->createdTables[] = $baseName;
+        }
     }
 
     public function isDone(): bool
@@ -74,6 +104,9 @@ final class ImportCursor
             'uploads_failed' => $this->uploadsFailed,
             'target_site_url' => $this->targetSiteUrl,
             'target_home_url' => $this->targetHomeUrl,
+            'swap_mode' => $this->swapMode,
+            'work_prefix' => $this->workPrefix,
+            'created_tables' => $this->createdTables,
         ];
     }
 
@@ -98,6 +131,12 @@ final class ImportCursor
             uploadsFailed: (int) ($data['uploads_failed'] ?? 0),
             targetSiteUrl: (string) ($data['target_site_url'] ?? ''),
             targetHomeUrl: (string) ($data['target_home_url'] ?? ''),
+            swapMode: (bool) ($data['swap_mode'] ?? false),
+            workPrefix: (string) ($data['work_prefix'] ?? ''),
+            createdTables: array_values(array_map(
+                'strval',
+                is_array($data['created_tables'] ?? null) ? $data['created_tables'] : []
+            )),
         );
     }
 }
