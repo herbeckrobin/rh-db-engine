@@ -115,6 +115,12 @@ final class TableSwap
         global $wpdb;
 
         $dropped = 0;
+
+        // Ohne diesen Schalter scheitert das Entfernen einer Tabelle, auf die eine andere
+        // per Fremdschlüssel verweist, und die Reste blieben liegen.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Sitzungs-Schalter, kein Datenzugriff.
+        $wpdb->query('SET FOREIGN_KEY_CHECKS=0');
+
         foreach ([self::STAGE_PREFIX, self::RETIRED_PREFIX] as $prefix) {
             foreach ($this->tablesWithPrefix($prefix) as $table) {
                 // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Tabellenname stammt aus SHOW TABLES mit festem Prefix, kein Nutzer-Input.
@@ -172,6 +178,11 @@ final class TableSwap
             return;
         }
 
+        // Die Live-Tabellen können untereinander per Fremdschlüssel verbunden sein. Sie
+        // wandern in derselben Anweisung, InnoDB soll dabei nicht zwischendurch prüfen.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Sitzungs-Schalter, kein Datenzugriff.
+        $wpdb->query('SET FOREIGN_KEY_CHECKS=0');
+
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Tabellennamen aus festen Prefixen plus SHOW-TABLES-Ergebnis, kein Nutzer-Input.
         $result = $wpdb->query('RENAME TABLE ' . implode(', ', $pairs));
 
@@ -184,7 +195,11 @@ final class TableSwap
 
         // Ab hier ist die Site auf dem neuen Stand. Die alten Tabellen sind nur noch Ballast:
         // ein Fehlschlag beim Aufräumen ist kein Grund, den gelungenen Import als gescheitert
-        // zu melden.
+        // zu melden. Sie müssen aber weg, bevor die Fremdschlüssel gesetzt werden, sonst
+        // sind deren Namen noch belegt.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Sitzungs-Schalter, kein Datenzugriff.
+        $wpdb->query('SET FOREIGN_KEY_CHECKS=0');
+
         foreach ($retired as $table) {
             $this->suppressed(static function () use ($wpdb, $table): void {
                 // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- fester Prefix plus geprüfter Basisname.

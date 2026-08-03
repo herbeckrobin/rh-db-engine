@@ -19,6 +19,7 @@ final class ImportCursor
     public const PHASE_META_REWRITE = 'meta_rewrite';
     public const PHASE_URL_REWRITE = 'url_rewrite';
     public const PHASE_SWAP = 'swap';
+    public const PHASE_CONSTRAINTS = 'constraints';
     public const PHASE_UPLOADS = 'uploads';
     public const PHASE_DONE = 'done';
 
@@ -49,7 +50,21 @@ final class ImportCursor
         public bool $swapMode = false,
         public string $workPrefix = '',
         public array $createdTables = [],
+        public bool $swapDone = false,
+        public array $deferredKeys = [],
+        public int $deferredKeyIndex = 0,
     ) {
+    }
+
+    /**
+     * Wurden die Live-Daten dieses Imports schon angefasst?
+     *
+     * Im Umschalt-Modus erst mit dem `RENAME TABLE`. Vorher liegt alles in Schattentabellen,
+     * ein Fehlschlag braucht dann auch kein Zurückspielen: es gibt nichts zurückzuspielen.
+     */
+    public function liveDataTouched(): bool
+    {
+        return !$this->swapMode || $this->swapDone;
     }
 
     public static function start(string $zipPath, string $workdir): self
@@ -107,6 +122,9 @@ final class ImportCursor
             'swap_mode' => $this->swapMode,
             'work_prefix' => $this->workPrefix,
             'created_tables' => $this->createdTables,
+            'swap_done' => $this->swapDone,
+            'deferred_keys' => $this->deferredKeys,
+            'deferred_key_index' => $this->deferredKeyIndex,
         ];
     }
 
@@ -137,6 +155,9 @@ final class ImportCursor
                 'strval',
                 is_array($data['created_tables'] ?? null) ? $data['created_tables'] : []
             )),
+            swapDone: (bool) ($data['swap_done'] ?? false),
+            deferredKeys: is_array($data['deferred_keys'] ?? null) ? $data['deferred_keys'] : [],
+            deferredKeyIndex: (int) ($data['deferred_key_index'] ?? 0),
         );
     }
 }

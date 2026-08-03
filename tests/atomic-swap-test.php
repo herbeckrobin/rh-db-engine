@@ -130,6 +130,20 @@ final class FakeWpdb
         'live_posts' => true,
         'live_users' => true,
         'live_usermeta' => true,
+        'live_quarantine' => true,
+    ];
+
+    /**
+     * Belegte Constraint-Namen, Name => Tabelle.
+     *
+     * InnoDB verlangt sie datenbankweit eindeutig. Die Live-Tabelle hält sie bereits, genau
+     * daran ist der erste Produktivlauf gescheitert (errno 121).
+     *
+     * @var array<string, string>
+     */
+    public array $constraints = [
+        'vlsoa_684812f7206c4_created_by' => 'live_quarantine',
+        'vlsoa_684812f7206c4_scan_item_id' => 'live_quarantine',
     ];
 
     /** Wirft beim n-ten Statement, um einen harten Abbruch nachzustellen. 0 heisst nie. */
@@ -147,16 +161,55 @@ final class FakeWpdb
         }
 
         if (preg_match('/^CREATE TABLE `([^`]+)`/i', $sql, $m)) {
+            // errno 121 nachstellen: ein schon belegter Constraint-Name lässt die Tabelle
+            // nicht entstehen.
+            if (preg_match_all('/CONSTRAINT `([^`]+)`/i', $sql, $cc)) {
+                foreach ($cc[1] as $name) {
+                    if (isset($this->constraints[$name])) {
+                        $this->last_error = sprintf(
+                            "Can't create table `db`.`%s` (errno: 121 \"Duplicate key on write or update\")",
+                            $m[1]
+                        );
+                        return false;
+                    }
+                }
+                foreach ($cc[1] as $name) {
+                    $this->constraints[$name] = $m[1];
+                }
+            }
             $this->tables[$m[1]] = true;
         }
+
+        if (preg_match('/^ALTER TABLE `([^`]+)` ADD (?:CONSTRAINT `([^`]+)` )?FOREIGN KEY/i', $sql, $m)) {
+            $name = $m[2] ?? '';
+            if ($name !== '' && isset($this->constraints[$name])) {
+                $this->last_error = 'Duplicate foreign key constraint name';
+                return false;
+            }
+            if ($name !== '') {
+                $this->constraints[$name] = $m[1];
+            }
+        }
+
         if (preg_match('/^DROP TABLE IF EXISTS `([^`]+)`/i', $sql, $m)) {
             unset($this->tables[$m[1]]);
+            foreach ($this->constraints as $name => $owner) {
+                if ($owner === $m[1]) {
+                    unset($this->constraints[$name]);
+                }
+            }
         }
+
         if (stripos($sql, 'RENAME TABLE ') === 0) {
             if (preg_match_all('/`([^`]+)` TO `([^`]+)`/', $sql, $mm, PREG_SET_ORDER)) {
                 foreach ($mm as $pair) {
                     unset($this->tables[$pair[1]]);
                     $this->tables[$pair[2]] = true;
+                    foreach ($this->constraints as $name => $owner) {
+                        if ($owner === $pair[1]) {
+                            $this->constraints[$name] = $pair[2];
+                        }
+                    }
                 }
             }
         }
@@ -245,6 +298,7 @@ require_once dirname(__DIR__) . '/src/SearchReplace.php';
 require_once dirname(__DIR__) . '/src/Storage.php';
 require_once dirname(__DIR__) . '/src/ImportCursor.php';
 require_once dirname(__DIR__) . '/src/SwapUnavailable.php';
+require_once dirname(__DIR__) . '/src/ForeignKeys.php';
 require_once dirname(__DIR__) . '/src/TableSwap.php';
 require_once dirname(__DIR__) . '/src/Importer.php';
 
@@ -262,8 +316,14 @@ function check(string $label, bool $ok, string $detail = ''): void
     }
 }
 
-/** Legt ein Backup-ZIP an, wie der Exporter es schreibt. */
-function makeBackupZip(string $path, string $sourcePrefix): void
+/**
+ * Legt ein Backup-ZIP an, wie der Exporter es schreibt.
+ *
+ * Eine der Tabellen trägt benannte Fremdschlüssel, so wie sie in der Praxis von Plugins
+ * kommen (Defender). InnoDB verlangt Constraint-Namen datenbankweit eindeutig, daran ist
+ * der erste Produktivlauf gescheitert.
+ */
+function makeBackupZip(string $path, string $sourcePrefix, bool $withForeignKeys = true): void
 {
     $sql = "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n";
     foreach (['options', 'posts', 'users', 'usermeta'] as $table) {
@@ -274,6 +334,25 @@ function makeBackupZip(string $path, string $sourcePrefix): void
         $sql .= "INSERT INTO `{$full}` (id, wert) VALUES (1, 'https://quelle.example/eins');\n";
         $sql .= "INSERT INTO `{$full}` (id, wert) VALUES (2, 'zwei');\n";
     }
+
+    if ($withForeignKeys) {
+        $full = $sourcePrefix . 'quarantine';
+        $sql .= "\n-- Table: {$full}\n";
+        $sql .= "DROP TABLE IF EXISTS `{$full}`;\n";
+        $sql .= "CREATE TABLE `{$full}` (\n"
+            . "  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n"
+            . "  `created_by` bigint(20) DEFAULT NULL,\n"
+            . "  `scan_item_id` bigint(20) DEFAULT NULL,\n"
+            . "  PRIMARY KEY (`id`),\n"
+            . "  KEY `created_by` (`created_by`),\n"
+            // Die Namen tragen absichtlich den Prefix einer DRITTEN Site, genau wie im
+            // echten Fall: Altlast aus einem früheren Import.
+            . "  CONSTRAINT `vlsoa_684812f7206c4_created_by` FOREIGN KEY (`created_by`) REFERENCES `{$sourcePrefix}users` (`id`) ON DELETE CASCADE,\n"
+            . "  CONSTRAINT `vlsoa_684812f7206c4_scan_item_id` FOREIGN KEY (`scan_item_id`) REFERENCES `{$sourcePrefix}posts` (`id`)\n"
+            . ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n";
+        $sql .= "INSERT INTO `{$full}` (id, created_by) VALUES (1, 1);\n";
+    }
+
     $sql .= "\nSET FOREIGN_KEY_CHECKS=1;\n";
 
     $manifest = json_encode([
@@ -428,7 +507,7 @@ $cursor = $runImport(RhDbEngine\ImportCursor::start($zipPath, WP_CONTENT_DIR . '
 
 $rename = renameStatements($GLOBALS['wpdb']->queries)[0] ?? '';
 
-foreach (['options', 'posts', 'users', 'usermeta'] as $base) {
+foreach (['options', 'posts', 'users', 'usermeta', 'quarantine'] as $base) {
     check(
         "Tabelle {$base}: alt weicht und neu rückt nach",
         str_contains($rename, "`live_{$base}` TO `rhold_{$base}`")
@@ -438,7 +517,7 @@ foreach (['options', 'posts', 'users', 'usermeta'] as $base) {
 check('Die alten Tabellen werden danach entfernt', count(array_filter(
     $GLOBALS['wpdb']->queries,
     static fn (string $q): bool => str_contains($q, 'DROP TABLE IF EXISTS `rhold_')
-)) === 4);
+)) === 5);
 
 // ------------------------------------------------------------
 echo "\n4. Die site-eigenen Options stehen vor dem Umschalten bereit\n";
@@ -458,7 +537,7 @@ foreach ($queries as $i => $q) {
 
 check('Die Options gingen in die Schattentabelle', $guardIndex !== null);
 check('Und zwar vor dem Umschalten', $guardIndex !== null && $renameIndex !== null && $guardIndex < $renameIndex);
-check('Nach dem Umschalten wird an den Live-Tabellen nichts mehr repariert', destructiveOn(
+check('Nach dem Umschalten werden keine Daten mehr nachgezogen', destructiveOn(
     array_slice($queries, ($renameIndex ?? 0) + 1),
     'live_'
 ) === []);
@@ -502,6 +581,112 @@ check('Der Import lief im direkten Modus', $cursor->swapMode === false);
 check('Der Aufrufer wurde gewarnt', is_string($warned) && $warned !== '');
 check('Und hat direkt in die Live-Tabellen geschrieben', destructiveOn($GLOBALS['wpdb']->queries, 'live_') !== []);
 check('Ohne Umschalt-Statement', renameStatements($GLOBALS['wpdb']->queries) === []);
+
+// ------------------------------------------------------------
+echo "\n7. Tabellen mit benannten Fremdschlüsseln\n";
+// ------------------------------------------------------------
+
+$GLOBALS['wpdb'] = new FakeWpdb();
+$GLOBALS['rh_filters'] = [];
+$GLOBALS['rh_actions'] = [];
+
+$cursor = $runImport(RhDbEngine\ImportCursor::start($zipPath, WP_CONTENT_DIR . '/job7'));
+$queries = $GLOBALS['wpdb']->queries;
+
+check('Der Import läuft trotz belegter Constraint-Namen durch', $cursor->isDone() && $cursor->swapMode);
+
+$stageCreate = '';
+foreach ($queries as $q) {
+    if (str_starts_with($q, 'CREATE TABLE `rhstg_quarantine`')) {
+        $stageCreate = $q;
+    }
+}
+check('Die Schattentabelle entsteht ohne Fremdschlüssel', $stageCreate !== ''
+    && stripos($stageCreate, 'FOREIGN KEY') === false
+    && stripos($stageCreate, 'CONSTRAINT') === false, substr($stageCreate, 0, 200));
+check('Die übrigen Spalten bleiben erhalten', str_contains($stageCreate, '`created_by`')
+    && str_contains($stageCreate, 'PRIMARY KEY (`id`)')
+    && str_contains($stageCreate, 'ENGINE=InnoDB'));
+
+$alters = array_values(array_filter(
+    $queries,
+    static fn (string $q): bool => stripos($q, 'ALTER TABLE') === 0 && stripos($q, 'FOREIGN KEY') !== false
+));
+check('Beide Fremdschlüssel werden nachträglich gesetzt', count($alters) === 2, implode("\n", $alters));
+check('Auf der Live-Tabelle', $alters !== [] && str_contains($alters[0], 'ALTER TABLE `live_quarantine`'));
+check(
+    'Der Verweis zeigt auf die Live-Tabelle, nicht auf die der Quelle',
+    $alters !== [] && str_contains($alters[0], 'REFERENCES `live_users`') && !str_contains($alters[0], '`src_users`')
+);
+check(
+    'Die ursprünglichen Namen bleiben erhalten',
+    $alters !== [] && str_contains($alters[0], 'CONSTRAINT `vlsoa_684812f7206c4_created_by`')
+);
+check('Die Verweis-Aktion bleibt erhalten', $alters !== [] && str_contains($alters[0], 'ON DELETE CASCADE'));
+
+$alterIndex = null;
+foreach ($queries as $i => $q) {
+    if (stripos($q, 'ALTER TABLE') === 0 && stripos($q, 'FOREIGN KEY') !== false) {
+        $alterIndex = $i;
+        break;
+    }
+}
+$dropOldIndex = null;
+foreach ($queries as $i => $q) {
+    if (str_contains($q, 'DROP TABLE IF EXISTS `rhold_quarantine`')) {
+        $dropOldIndex = $i;
+    }
+}
+check(
+    'Erst wenn die alte Tabelle weg ist, sonst wäre der Name noch belegt',
+    $alterIndex !== null && $dropOldIndex !== null && $dropOldIndex < $alterIndex
+);
+check('Die Fremdschlüssel sitzen am Ende auf der Live-Tabelle', ($GLOBALS['wpdb']->constraints['vlsoa_684812f7206c4_created_by'] ?? '') === 'live_quarantine');
+
+// ------------------------------------------------------------
+echo "\n8. Ein Fremdschlüssel darf den Import nicht kippen\n";
+// ------------------------------------------------------------
+
+$GLOBALS['wpdb'] = new FakeWpdb();
+// Der Name bleibt nach dem Umschalten belegt, weil eine fremde Tabelle ihn hält.
+$GLOBALS['wpdb']->constraints['vlsoa_684812f7206c4_created_by'] = 'fremde_tabelle';
+$GLOBALS['wpdb']->tables['fremde_tabelle'] = true;
+
+$cursor = $runImport(RhDbEngine\ImportCursor::start($zipPath, WP_CONTENT_DIR . '/job8'));
+
+check('Der Import läuft durch', $cursor->isDone());
+$alters = array_values(array_filter(
+    $GLOBALS['wpdb']->queries,
+    static fn (string $q): bool => stripos($q, 'ALTER TABLE') === 0 && stripos($q, 'FOREIGN KEY') !== false
+));
+check('Es wird ein Ersatzname versucht', count($alters) === 3, implode("\n", $alters));
+check(
+    'Und der Fremdschlüssel sitzt trotzdem',
+    isset($GLOBALS['wpdb']->constraints['live_quarantine_fk_1'])
+);
+
+// ------------------------------------------------------------
+echo "\n9. Ohne Umschalten ist die Site unbeschädigt\n";
+// ------------------------------------------------------------
+
+$GLOBALS['wpdb'] = new FakeWpdb();
+$GLOBALS['wpdb']->dieAtQuery = 12;
+$cursor = RhDbEngine\ImportCursor::start($zipPath, WP_CONTENT_DIR . '/job9');
+try {
+    $cursor = $runImport($cursor);
+} catch (\RuntimeException $e) {
+    // erwartet
+}
+check('Es wurde nicht umgeschaltet', $cursor->swapDone === false);
+check('Also gilt die Site als unberührt', $cursor->liveDataTouched() === false);
+
+$GLOBALS['wpdb']->dieAtQuery = 0;
+$left = (new RhDbEngine\TableSwap())->dropLeftovers();
+check('Die Reste lassen sich aufräumen', $left > 0);
+check('Danach ist keine Schattentabelle mehr da', array_filter(
+    array_keys($GLOBALS['wpdb']->tables),
+    static fn (string $t): bool => str_starts_with($t, 'rhstg_') || str_starts_with($t, 'rhold_')
+) === []);
 
 // ------------------------------------------------------------
 

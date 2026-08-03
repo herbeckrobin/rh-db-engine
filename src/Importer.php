@@ -109,6 +109,9 @@ final class Importer
                     case ImportCursor::PHASE_SWAP:
                         $this->stepSwap($cursor);
                         break;
+                    case ImportCursor::PHASE_CONSTRAINTS:
+                        $this->stepConstraints($cursor, $deadline);
+                        break;
                     case ImportCursor::PHASE_UPLOADS:
                         $this->stepUploads($cursor, $includeUploads, $deadline);
                         break;
@@ -167,6 +170,8 @@ final class Importer
         $cursor->swapMode = false;
         $cursor->workPrefix = $cursor->targetPrefix;
         $cursor->createdTables = [];
+        $cursor->deferredKeys = [];
+        $cursor->deferredKeyIndex = 0;
         $cursor->sqlByteOffset = 0;
         $cursor->urlRewriteTableIndex = 0;
         $cursor->urlRewriteRowOffset = 0;
@@ -423,6 +428,11 @@ final class Importer
 
         $this->rememberCreatedTable($sql, $cursor, $workPrefix);
 
+        // Fremdschlüssel gehören nicht in die Schattentabelle: ihre Namen müssen
+        // datenbankweit eindeutig sein, und die Originaltabelle hält sie noch. Sie werden
+        // abgetrennt und gesetzt, sobald die Tabellen live sind (siehe stepConstraints).
+        $sql = $this->deferForeignKeys($sql, $cursor, $workPrefix);
+
         // Ein Fehlschlag darf NICHT still durchrutschen: an dieser Stelle sind Tabellen
         // bereits gedroppt, ein ignorierter Fehler hinterlässt eine halb ersetzte Datenbank,
         // die als erfolgreicher Import gemeldet wird.
@@ -539,7 +549,7 @@ final class Importer
     private function stepSwap(ImportCursor $cursor): void
     {
         if (!$cursor->swapMode) {
-            $cursor->phase = ImportCursor::PHASE_UPLOADS;
+            $cursor->phase = ImportCursor::PHASE_CONSTRAINTS;
             return;
         }
 
@@ -557,14 +567,111 @@ final class Importer
         );
 
         (new TableSwap())->swap($cursor->createdTables, $cursor->targetPrefix);
+        $cursor->swapDone = true;
 
-        // Der Objekt-Cache zeigt jetzt noch auf den alten Stand. Die Medien-Phase läuft
-        // gleich über viele weitere Ticks, so lange darf die Site nicht falsch antworten.
+        // Der Objekt-Cache zeigt jetzt noch auf den alten Stand. Die folgenden Phasen laufen
+        // über viele weitere Ticks, so lange darf die Site nicht falsch antworten.
         $this->flushCaches();
 
         do_action('rh-db-engine/after_table_swap', $cursor->targetPrefix, $cursor->createdTables);
 
+        $cursor->phase = ImportCursor::PHASE_CONSTRAINTS;
+    }
+
+    /**
+     * Setzt die abgetrennten Fremdschlüssel, jetzt wo die Tabellen live sind.
+     *
+     * Erst hier sind die Constraint-Namen frei (die alten Tabellen wurden beim Umschalten
+     * entfernt) und die Verweise treffen die richtigen Tabellen. Prüfungen bleiben dabei
+     * aus: die Daten kommen aus einem Dump, der beim Schreiben schon konsistent war, und
+     * eine nachträgliche Prüfung über Millionen Zeilen wäre nur teuer.
+     *
+     * Ein Fremdschlüssel, der sich nicht setzen lässt, bricht den Import NICHT ab. Er ist
+     * eine Integritätsregel, kein Inhalt: eine Site ohne ihn funktioniert, eine Site ohne
+     * Import nicht.
+     */
+    private function stepConstraints(ImportCursor $cursor, float $deadline): void
+    {
+        global $wpdb;
+
+        if ($cursor->deferredKeys === []) {
+            $cursor->phase = ImportCursor::PHASE_UPLOADS;
+            return;
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Sitzungs-Schalter, kein Datenzugriff.
+        $wpdb->query('SET FOREIGN_KEY_CHECKS=0');
+
+        $total = count($cursor->deferredKeys);
+        $skipped = 0;
+
+        while ($cursor->deferredKeyIndex < $total) {
+            $index = $cursor->deferredKeyIndex;
+            $key = $cursor->deferredKeys[$index];
+            $cursor->deferredKeyIndex++;
+
+            if (!$this->addForeignKey($cursor, $key, $index)) {
+                $skipped++;
+            }
+
+            if (microtime(true) >= $deadline) {
+                return;
+            }
+        }
+
+        if ($skipped > 0) {
+            /**
+             * Einzelne Fremdschlüssel fehlen. Der Aufrufer entscheidet, wie er das zeigt.
+             */
+            do_action('rh-db-engine/import_incomplete_constraints', $skipped);
+        }
+
         $cursor->phase = ImportCursor::PHASE_UPLOADS;
+    }
+
+    /**
+     * Setzt einen einzelnen Fremdschlüssel, bei Namenskollision unter einem Ersatznamen.
+     *
+     * @param array<string, mixed> $key
+     * @return bool false, wenn er auch mit Ersatznamen nicht gesetzt werden konnte.
+     */
+    private function addForeignKey(ImportCursor $cursor, array $key, int $index): bool
+    {
+        global $wpdb;
+
+        $base = (string) ($key['table'] ?? '');
+        if ($base === '') {
+            return false;
+        }
+
+        /** @var array{name: ?string, columns: string, ref_table: string, ref_columns: string, actions: string} $definition */
+        $definition = [
+            'name' => isset($key['name']) ? (string) $key['name'] : null,
+            'columns' => (string) ($key['columns'] ?? ''),
+            'ref_table' => (string) ($key['ref_table'] ?? ''),
+            'ref_columns' => (string) ($key['ref_columns'] ?? ''),
+            'actions' => (string) ($key['actions'] ?? ''),
+        ];
+
+        $table = $cursor->targetPrefix . $base;
+
+        $before = $wpdb->suppress_errors(true);
+        try {
+            $sql = ForeignKeys::addStatement($table, $definition, $cursor->sourcePrefix, $cursor->targetPrefix);
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Definition stammt aus der CREATE-Anweisung des eigenen Dumps.
+            if ($wpdb->query($sql) !== false) {
+                return true;
+            }
+
+            // Der ursprüngliche Name ist noch belegt, meist ein Rest aus einem früheren
+            // Lauf. Ein abgeleiteter Ersatzname ist besser als ein fehlender Fremdschlüssel.
+            $fallback = ForeignKeys::fallbackName($table, $definition, $index);
+            $sql = ForeignKeys::addStatement($table, $definition, $cursor->sourcePrefix, $cursor->targetPrefix, $fallback);
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- wie oben, nur mit Ersatznamen.
+            return $wpdb->query($sql) !== false;
+        } finally {
+            $wpdb->suppress_errors($before);
+        }
     }
 
     private function stepUploads(ImportCursor $cursor, bool $includeUploads, float $deadline): void
@@ -926,6 +1033,38 @@ final class Importer
         }
 
         $cursor->rememberTable($base);
+    }
+
+    /**
+     * Trennt die Fremdschlüssel einer CREATE-Anweisung ab und merkt sie für später vor.
+     *
+     * Gilt in beiden Modi. Im Umschalt-Modus ist es die Voraussetzung dafür, dass die
+     * Schattentabelle überhaupt entstehen kann. Im direkten Modus ist es der Weg, die
+     * Verweise auf den Ziel-Prefix zu ziehen, statt sie auf die Tabellen der Quellseite
+     * zeigen zu lassen.
+     */
+    private function deferForeignKeys(string $sql, ImportCursor $cursor, string $workPrefix): string
+    {
+        if (strncasecmp($sql, 'CREATE TABLE', 12) !== 0) {
+            return $sql;
+        }
+
+        $table = $this->extractTableFromStatement($sql);
+        if ($table === null || !str_starts_with($table, $workPrefix)) {
+            return $sql;
+        }
+
+        $result = ForeignKeys::strip($sql);
+        if ($result['keys'] === []) {
+            return $sql;
+        }
+
+        $base = substr($table, strlen($workPrefix));
+        foreach ($result['keys'] as $key) {
+            $cursor->deferredKeys[] = ['table' => $base] + $key;
+        }
+
+        return $result['sql'];
     }
 
     /**

@@ -50,6 +50,9 @@ namespace {
     require_once dirname(__DIR__) . '/src/ImportCursor.php';
     require_once dirname(__DIR__) . '/src/Storage.php';
     require_once dirname(__DIR__) . '/src/SearchReplace.php';
+    require_once dirname(__DIR__) . '/src/ForeignKeys.php';
+    require_once dirname(__DIR__) . '/src/SwapUnavailable.php';
+    require_once dirname(__DIR__) . '/src/TableSwap.php';
     require_once dirname(__DIR__) . '/src/Importer.php';
 
     $failures = 0;
