@@ -28,13 +28,20 @@ final class Exporter
      *
      * @param array<int, string> $excludedTables Vollqualifizierte Tabellennamen, die nicht gedumpt werden.
      * @param string|null $targetDir Zielordner für das ZIP. Null = der normale backups/-Ordner.
+     * @param array<int, string> $excludedOptions Options, die nicht in den Dump wandern, siehe
+     *                                            {@see ExportCursor::optionExcluded()}. Leer lassen
+     *                                            für eine vollständige Sicherung.
      * @return string Absoluter Pfad zur ZIP-Datei.
      * @throws \RuntimeException
      */
-    public function createBackup(bool $includeUploads = false, array $excludedTables = [], ?string $targetDir = null): string
-    {
+    public function createBackup(
+        bool $includeUploads = false,
+        array $excludedTables = [],
+        ?string $targetDir = null,
+        array $excludedOptions = []
+    ): string {
         $workdir = $this->storage->jobWorkdir('export-' . wp_generate_password(8, false, false));
-        $cursor = ExportCursor::start($workdir, $includeUploads, $excludedTables, $targetDir);
+        $cursor = ExportCursor::start($workdir, $includeUploads, $excludedTables, $targetDir, $excludedOptions);
 
         try {
             do {
@@ -222,7 +229,12 @@ final class Exporter
     private function stepManifest(ExportCursor $cursor): void
     {
         $cursor->manifestPath = trailingslashit($cursor->workdir) . 'manifest.json';
-        $manifest = $this->buildManifest((string) $cursor->sqlPath, $cursor->includeUploads);
+        $manifest = $this->buildManifest(
+            (string) $cursor->sqlPath,
+            $cursor->includeUploads,
+            $cursor->excludedOptions,
+            $cursor->excludedTables
+        );
         $json = (string) wp_json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 
         if (file_put_contents($cursor->manifestPath, $json) !== strlen($json)) {
@@ -481,7 +493,19 @@ final class Exporter
         /** @var array<int, array<string, mixed>> $rows */
         $rows = (array) $wpdb->get_results($sql, ARRAY_A);
 
+        // Ausgeschlossene Options werden hier übersprungen und nicht schon in der Abfrage
+        // weggelassen: die Anzahl der geholten Zeilen steuert das Blättern. Würde die
+        // Abfrage filtern, hielte der Export eine gefilterte Teilmenge für das Ende der
+        // Tabelle und bräche mittendrin ab.
+        $filterOptions = $cursor->excludedOptions !== [] && $table === (string) $wpdb->options;
+
         foreach ($rows as $row) {
+            if ($filterOptions
+                && ExportCursor::optionExcluded((string) ($row['option_name'] ?? ''), $cursor->excludedOptions)
+            ) {
+                continue;
+            }
+
             $this->write($handle, $this->buildInsert($table, $row) . "\n");
         }
 
@@ -598,13 +622,26 @@ final class Exporter
     }
 
     /**
+     * @param array<int, string> $excludedOptions
+     * @param array<int, string> $excludedTables
      * @return array<string, mixed>
      */
-    private function buildManifest(string $sqlFile, bool $includeUploads): array
-    {
+    private function buildManifest(
+        string $sqlFile,
+        bool $includeUploads,
+        array $excludedOptions = [],
+        array $excludedTables = []
+    ): array {
         global $wpdb;
 
         return [
+            // Steht im Archiv, damit später niemand rätselt, warum eine Option fehlt. Ein
+            // Archiv mit Einträgen hier ist Transportware, keine vollständige Sicherung.
+            'excluded_options' => array_values($excludedOptions),
+            // Welche der ausgelassenen Tabellen es hier überhaupt gibt. Die Gegenseite kann
+            // damit erkennen, dass ihr eine fehlt, die hier in Benutzung ist. Ohne diese
+            // Angabe müsste sie raten, welches Plugin welche Tabelle braucht.
+            'excluded_tables_present' => $this->existingTables($excludedTables),
             'plugin_version' => (string) apply_filters(
                 'rh-db-engine/manifest_creator_version',
                 defined('RHDBENGINE_VERSION') ? RHDBENGINE_VERSION : '0.0.0'
@@ -617,6 +654,32 @@ final class Exporter
             'includes_uploads' => $includeUploads,
             'created_at' => gmdate('c'),
         ];
+    }
+
+    /**
+     * Welche dieser Tabellen gibt es hier wirklich?
+     *
+     * @param array<int, string> $tables
+     * @return array<int, string>
+     */
+    private function existingTables(array $tables): array
+    {
+        global $wpdb;
+
+        $vorhanden = [];
+        foreach ($tables as $table) {
+            $table = (string) $table;
+            if ($table === '') {
+                continue;
+            }
+
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- SHOW TABLES, einmalig beim Export.
+            if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) !== null) {
+                $vorhanden[] = $table;
+            }
+        }
+
+        return $vorhanden;
     }
 
     private function materializeUploadList(string $uploadBase, string $listFile): void

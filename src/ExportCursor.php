@@ -26,6 +26,12 @@ final class ExportCursor
      * @param string|null            $stopBefore     Phase, vor der angehalten wird. Für Aufrufer, die
      *                                                nur Dump und Manifest brauchen und das Archiv
      *                                                selbst erzeugen.
+     * @param array<int, string>     $excludedOptions Options, die nicht in den Dump wandern. Ein Eintrag
+     *                                                mit `*` am Ende schliesst alles mit diesem Anfang
+     *                                                aus, sonst zählt der genaue Name. Greift nur auf
+     *                                                der Options-Tabelle. Gedacht für instanzgebundene
+     *                                                Schlüssel, die auf der Gegenseite nichts verloren
+     *                                                haben (Kopplungen, Zugangsdaten, Protokolle).
      */
     public function __construct(
         public string $workdir,
@@ -42,7 +48,40 @@ final class ExportCursor
         public ?string $targetDir = null,
         public ?array $rowKey = null,
         public ?string $stopBefore = null,
+        public array $excludedOptions = [],
     ) {
+    }
+
+    /**
+     * Gehört diese Option zu den ausgeschlossenen?
+     *
+     * Bewusst kein SQL-LIKE: dort ist `_` ein Platzhalter, und genau der steckt in jedem
+     * WordPress-Optionsnamen. Ein Stern am Ende meint "alles mit diesem Anfang", alles
+     * andere ist der genaue Name.
+     *
+     * @param array<int, string> $excluded
+     */
+    public static function optionExcluded(string $name, array $excluded): bool
+    {
+        foreach ($excluded as $muster) {
+            $muster = (string) $muster;
+            if ($muster === '') {
+                continue;
+            }
+
+            if (str_ends_with($muster, '*')) {
+                if (str_starts_with($name, substr($muster, 0, -1))) {
+                    return true;
+                }
+                continue;
+            }
+
+            if ($name === $muster) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -50,9 +89,20 @@ final class ExportCursor
      *                               backups/-Ordner. Wird für Sicherungskopien genutzt,
      *                               die nicht in der Backup-Liste des Nutzers auftauchen sollen.
      */
-    public static function start(string $workdir, bool $includeUploads, array $excludedTables = [], ?string $targetDir = null): self
-    {
-        return new self($workdir, $includeUploads, $excludedTables, targetDir: $targetDir);
+    public static function start(
+        string $workdir,
+        bool $includeUploads,
+        array $excludedTables = [],
+        ?string $targetDir = null,
+        array $excludedOptions = []
+    ): self {
+        return new self(
+            $workdir,
+            $includeUploads,
+            $excludedTables,
+            targetDir: $targetDir,
+            excludedOptions: $excludedOptions
+        );
     }
 
     public function isDone(): bool
@@ -80,6 +130,7 @@ final class ExportCursor
             'target_dir' => $this->targetDir,
             'row_key' => $this->rowKey,
             'stop_before' => $this->stopBefore,
+            'excluded_options' => $this->excludedOptions,
         ];
     }
 
@@ -103,6 +154,7 @@ final class ExportCursor
             targetDir: isset($data['target_dir']) ? (string) $data['target_dir'] : null,
             rowKey: is_array($data['row_key'] ?? null) ? array_map('strval', $data['row_key']) : null,
             stopBefore: isset($data['stop_before']) ? (string) $data['stop_before'] : null,
+            excludedOptions: is_array($data['excluded_options'] ?? null) ? array_map('strval', $data['excluded_options']) : [],
         );
     }
 }
